@@ -1,0 +1,35 @@
+# Raíz del proyecto
+.env
+.env.*.local
+!.env.example
+backend/.env
+backend/.env.docker.local
+backend/.env.production
+
+# Node (cualquier subcarpeta)
+node_modules/
+dist/
+coverage/
+*.log
+npm-debug.log*
+
+# Angular — frontend/
+frontend/.angular/
+frontend/dist/
+
+# Nest — backend/
+backend/dist/
+
+# Python — ocr/ y entornos locales en cualquier carpeta
+.venv/
+venv/
+ocr/__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.idea/
+*.swp
+.DS_Store
