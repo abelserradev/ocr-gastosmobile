@@ -33,6 +33,23 @@ python src/main.py
 uvicorn src.main:app --host 0.0.0.0 --port 8001 --reload
 ```
 
+## Docker (NVIDIA GPU en el host)
+
+El servicio vive en esta carpeta (`ocr/`). El código Nest que llama al OCR está en `backend/src/ocr/` (no es este contenedor).
+
+**Requisitos:** Docker, [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) y driver propio del host (p. ej. Quadro P600).
+
+```bash
+cd ocr/
+docker compose up --build -d
+# Health: curl -s http://localhost:8001/health
+```
+
+- Caché de Hugging Face en el volumen `huggingface_ocr_cache` (no re-descarga el `.mf.gz` en cada `docker compose down` sin `-v`).
+- **`MOONDREAM_ONNX_VARIANT=0.5b`** recomendable si la GPU tiene poca VRAM (p. ej. 2GB): añádelo bajo `environment` en `docker-compose.yml` o en un `.env` junto al compose.
+- **Solo CPU:** comenta `gpus: all` en `docker-compose.yml` y ejecuta `docker compose build --build-arg USE_GPU=0` antes del `up`.
+- **Cloudflare:** el proxy naranja corta ~100s; inferencias largas pueden necesitar DNS only, async job o API Moondream en nube (`MOONDREAM_API_KEY`).
+
 ## Endpoints
 
 | Método | Endpoint | Descripción |
@@ -90,4 +107,4 @@ OCR_SERVICE_URL=http://localhost:8001  # default
 
 **Modelo no carga:** Verificar conexión a HuggingFace (primera vez requiere internet).
 
-**Timeout:** El backend NestJS tiene timeout de 30s; imágenes grandes pueden tardar más.
+**Timeout:** Configura `OCR_FORWARD_TIMEOUT_MS` en el backend si la inferencia supera el valor por defecto; revisa también timeouts del reverse proxy (Traefik/Cloudflare).

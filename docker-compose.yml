@@ -1,0 +1,46 @@
+# Servicio OCR (FastAPI + Moondream). Ubicación real del código: carpeta ocr/ del repo.
+# El módulo Nest vive en backend/src/ocr/ y solo hace HTTP a este servicio.
+#
+# Requisitos GPU (NVIDIA): Docker + nvidia-container-toolkit en el host.
+# Ver: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#
+# Solo CPU (p. ej. portátil sin NVIDIA): comenta el bloque `deploy` y reconstruye con USE_GPU=0:
+#   docker compose build --build-arg USE_GPU=0
+#
+services:
+  ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        USE_GPU: "1"
+    image: gastos-ocr:local
+    container_name: gastos-ocr
+    ports:
+      - "${OCR_PORT:-8001}:8001"
+    environment:
+      PORT: "8001"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # VRAM limitada (p. ej. Quadro P600 2GB): mantener 0.5b; 2b puede fallar por memoria
+      MOONDREAM_ONNX_VARIANT: "0.5b"
+      # MOONDREAM_API_KEY: ""           # alternativa: nube, sin pesos locales
+      # MOONDREAM_MODEL_PATH: ""        # o .mf/.gz ya descargado (montar volumen)
+      # MOONDREAM_ONNX_VARIANT: "0.5b"  # recomendado en GPUs con poca VRAM (p. ej. 2GB)
+      # HF_HOME ya es /var/cache/huggingface en el Dockerfile
+    # Variables extra: copia .env.example → .env en esta carpeta o define aquí bajo `environment`.
+    volumes:
+      - huggingface_ocr_cache:/var/cache/huggingface
+    # Requiere Docker con soporte GPU (nvidia-container-toolkit). Sin GPU: comenta la línea siguiente
+    # y haz build con: docker compose build --build-arg USE_GPU=0
+    gpus: all
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  huggingface_ocr_cache:
