@@ -7,6 +7,7 @@ import asyncio
 import io
 import os
 import re
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
@@ -23,6 +24,7 @@ from moondream.types import VLM
 DEFAULT_MOONDREAM_MF_REVISION = "9dddae84d54db4ac56fe37817aeaeb502ed083e2"
 
 _moondream_vlm: Optional[VLM] = None
+_moondream_lock = threading.Lock()
 
 
 def _default_mf_filename_from_env() -> str:
@@ -72,7 +74,11 @@ def _create_moondream_vlm() -> VLM:
 def get_moondream_model() -> VLM:
     """Singleton del modelo; moondream 0.0.5 expone query(image, question) -> {'answer': str}."""
     global _moondream_vlm
-    if _moondream_vlm is None:
+    if _moondream_vlm is not None:
+        return _moondream_vlm
+    with _moondream_lock:
+        if _moondream_vlm is not None:
+            return _moondream_vlm
         try:
             _moondream_vlm = _create_moondream_vlm()
         except Exception as err:
@@ -81,17 +87,23 @@ def get_moondream_model() -> VLM:
     return _moondream_vlm
 
 
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
-    # Precarga en hilo para no bloquear el event loop (HF + cargar ONNX es pesado)
+async def _precargar_moondream_en_fondo() -> None:
+    """HF + ONNX puede tardar minutos; no debe retrasar el accept() de Uvicorn ni el healthcheck del proxy."""
     try:
-        print("[OCR] Precarga del modelo Moondream…")
+        print(
+            "[OCR] Precarga Moondream en segundo plano (evita 502 del proxy mientras descarga/carga)…"
+        )
         await asyncio.to_thread(get_moondream_model)
-        print("[OCR] Modelo Moondream cargado")
+        print("[OCR] Modelo Moondream listo para inferencia")
     except Exception as err:
         print(
-            f"[OCR] Precarga omitida (se reintentará en /parse-invoice): {err}"
+            f"[OCR] Precarga en fondo falló (reintento al llamar /parse-invoice): {err}"
         )
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    asyncio.create_task(_precargar_moondream_en_fondo())
     yield
 
 
