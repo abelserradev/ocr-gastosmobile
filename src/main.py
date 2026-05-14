@@ -25,6 +25,8 @@ DEFAULT_MOONDREAM_MF_REVISION = "9dddae84d54db4ac56fe37817aeaeb502ed083e2"
 
 _moondream_vlm: Optional[VLM] = None
 _moondream_lock = threading.Lock()
+_precache_finished: bool = False
+_precache_error: Optional[str] = None
 
 
 def _default_mf_filename_from_env() -> str:
@@ -89,6 +91,9 @@ def get_moondream_model() -> VLM:
 
 async def _precargar_moondream_en_fondo() -> None:
     """HF + ONNX puede tardar minutos; no debe retrasar el accept() de Uvicorn ni el healthcheck del proxy."""
+    global _precache_finished, _precache_error
+    _precache_finished = False
+    _precache_error = None
     try:
         print(
             "[OCR] Precarga Moondream en segundo plano (evita 502 del proxy mientras descarga/carga)…"
@@ -96,9 +101,13 @@ async def _precargar_moondream_en_fondo() -> None:
         await asyncio.to_thread(get_moondream_model)
         print("[OCR] Modelo Moondream listo para inferencia")
     except Exception as err:
+        msg = str(err)
+        _precache_error = msg[:800] if len(msg) > 800 else msg
         print(
             f"[OCR] Precarga en fondo falló (reintento al llamar /parse-invoice): {err}"
         )
+    finally:
+        _precache_finished = True
 
 
 @asynccontextmanager
@@ -159,6 +168,14 @@ class HealthResponse(BaseModel):
     status: str
     model_loaded: bool
     version: str
+    precache_finished: bool = Field(
+        ...,
+        description="True cuando terminó el intento de precarga en segundo plano (éxito o error)",
+    )
+    precache_error: Optional[str] = Field(
+        None,
+        description="Si la precarga falló, mensaje breve; null si aún no terminó o fue OK",
+    )
 
 
 def extract_amount_from_text(text: str) -> tuple[Optional[float], str]:
@@ -296,26 +313,31 @@ async def parse_invoice(file: UploadFile = File(..., description="Imagen de la f
     """
     Recibe una imagen de factura y extrae: monto, fecha, comercio, descripción.
     """
-    # Validar tipo de archivo
-    content_type = file.content_type or ""
-    if not content_type.startswith("image/"):
+    contents = await file.read()
+    if len(contents) > 10 * 1024 * 1024:
         raise HTTPException(
-            status_code=400,
-            detail=f"Tipo de archivo no soportado: {content_type}. Solo se aceptan imágenes."
+            status_code=400, detail="Imagen demasiado grande (max 10MB)"
         )
+    if len(contents) == 0:
+        raise HTTPException(status_code=400, detail="Archivo vacío")
 
     try:
-        # Leer imagen
-        contents = await file.read()
-        if len(contents) > 10 * 1024 * 1024:  # 10MB max
-            raise HTTPException(status_code=400, detail="Imagen demasiado grande (max 10MB)")
-
         image = Image.open(io.BytesIO(contents))
+        image.load()
+    except Exception:
+        declared = file.content_type or "sin Content-Type"
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No se pudo abrir la imagen (tipo declarado: {declared}). "
+                "Usa JPG, PNG o WebP."
+            ),
+        )
 
-        # Convertir a RGB si es necesario
-        if image.mode != "RGB":
-            image = image.convert("RGB")
+    if image.mode != "RGB":
+        image = image.convert("RGB")
 
+    try:
         vlm = get_moondream_model()
 
         # Prompt optimizado para facturas
@@ -378,10 +400,13 @@ async def parse_invoice(file: UploadFile = File(..., description="Imagen de la f
 async def health_check():
     """Health check - indica si el modelo está cargado."""
     model_loaded = _moondream_vlm is not None
+    err = _precache_error if _precache_finished and not model_loaded else None
     return HealthResponse(
         status="ok",
         model_loaded=model_loaded,
-        version="0.1.0"
+        version="0.1.0",
+        precache_finished=_precache_finished,
+        precache_error=err,
     )
 
 
