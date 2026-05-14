@@ -1,7 +1,8 @@
 fastapi==0.115.0
 uvicorn[standard]==0.32.0
 python-multipart==0.0.17
-Pillow==11.0.0
+# moondream 0.0.5 exige pillow>=10.4,<11 (Pillow 11 rompe pip en Coolify/Nixpacks)
+Pillow>=10.4.0,<11.0.0
 moondream==0.0.5
 huggingface-hub>=0.25.0
 pydantic==2.9.2
