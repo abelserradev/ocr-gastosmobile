@@ -29,7 +29,8 @@ EXPOSE 8001
 CMD ["sh", "-c", "exec uvicorn src.main:app --host 0.0.0.0 --port \"${PORT:-8001}\" --timeout-keep-alive 120"]
 
 
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu24.04 AS gpu
+# 12.4.1-*-ubuntu24.04 no está publicado en Docker Hub; 12.6.3 sí (cuBLAS 12 para onnxruntime-gpu)
+FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04 AS gpu
 
 ENV DEBIAN_FRONTEND=noninteractive
 
