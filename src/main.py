@@ -1,6 +1,6 @@
 """
 Servicio OCR para extracción de datos de facturas.
-Usa Moondream para vision-language local y extracción de información.
+Híbrido: Tesseract (OCR clásico) + Moondream VLM; se fusionan campos con preferencia por Tesseract.
 """
 
 import asyncio
@@ -10,6 +10,7 @@ import os
 import re
 import threading
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -20,6 +21,11 @@ from huggingface_hub import hf_hub_download
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 from moondream.types import VLM
+
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
 
 # Revisión fijada: empaquetados .mf.gz usados en PyPI moondream 0.0.5; si HF deja de servirla, definir MOONDREAM_HF_REVISION.
 DEFAULT_MOONDREAM_MF_REVISION = "9dddae84d54db4ac56fe37817aeaeb502ed083e2"
@@ -127,7 +133,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="OCR Service - Gastos",
-    description="Extracción de datos de facturas usando Moondream",
+    description="Extracción de facturas: Tesseract (OCR) + Moondream (VLM)",
     version="0.1.0",
     lifespan=lifespan,
 )
@@ -158,7 +164,8 @@ class ParseInvoiceResponse(BaseModel):
         None, description="Descripción de items si está disponible"
     )
     raw_text: str = Field(
-        ..., description="Texto crudo extraído de la imagen"
+        ...,
+        description="Transcripciones híbridas: bloques # Tesseract (OCR) y # Moondream (VLM)",
     )
     confidence: float = Field(
         ..., ge=0.0, le=1.0, description="Confianza general de la extracción (0-1)"
@@ -202,6 +209,158 @@ def resize_image_if_too_large(image: Image.Image) -> Image.Image:
     return image.resize(new_size, Image.Resampling.LANCZOS)
 
 
+def run_tesseract_ocr(image: Image.Image) -> str:
+    """
+    OCR clásico (spa+eng): misma familia que tesseract.js en project-condominio.
+    Sin binario tesseract en PATH: cadena vacía; el flujo sigue con Moondream.
+    """
+    if pytesseract is None:
+        _logger.warning("pytesseract no instalado; salto Tesseract")
+        return ""
+    lang = os.getenv("OCR_TESSERACT_LANG", "spa+eng").strip() or "spa+eng"
+    config = os.getenv("OCR_TESSERACT_CONFIG", "--psm 6").strip() or "--psm 6"
+    try:
+        text = pytesseract.image_to_string(image, lang=lang, config=config)
+        return (text or "").strip()
+    except Exception as err:
+        _logger.warning("Tesseract no disponible o falló: %s", err)
+        return ""
+
+
+def tess_transcript_is_substantial(blob: str) -> bool:
+    """Suficiente texto para confiar en extracción sin depender sólo del VLM."""
+    s = (blob or "").strip()
+    if len(s) < 28:
+        return False
+    letters = sum(1 for c in s if c.isalpha())
+    return letters >= 10
+
+
+@dataclass
+class ParsedInvoiceFields:
+    amount: Optional[float]
+    structured_amount: Optional[float]
+    structured_currency_hint: str
+    heuristic_amount: Optional[float]
+    heuristic_currency: str
+    merchant: Optional[str]
+    date: Optional[str]
+    description: Optional[str]
+
+
+def parse_invoice_text_blob(parse_blob: str) -> ParsedInvoiceFields:
+    """Regex + heurísticas sobre un bloque (Tesseract o Moondream ya filtrado)."""
+    blob = (parse_blob or "").strip()
+    if not blob:
+        return ParsedInvoiceFields(
+            amount=None,
+            structured_amount=None,
+            structured_currency_hint="",
+            heuristic_amount=None,
+            heuristic_currency="",
+            merchant=None,
+            date=None,
+            description=None,
+        )
+
+    structured_amount, structured_currency_hint, structured_merchant, structured_date, structured_items = (
+        extract_structured_fields(blob)
+    )
+    heuristic_amount, heuristic_currency = extract_amount_from_text(blob)
+
+    amount_pick: Optional[float] = (
+        structured_amount
+        if structured_amount is not None and structured_amount > 0
+        else heuristic_amount
+    )
+
+    merchant_pick = structured_merchant or extract_merchant_from_text(blob)
+    date_pick = structured_date or extract_date_from_text(blob)
+
+    description_pick: Optional[str] = structured_items
+    if description_pick is None:
+        keyed_labels = frozenset({"items", "description", "productos", "articulos"})
+        for line in blob.split("\n"):
+            trimmed = line.strip()
+            if ":" not in trimmed:
+                continue
+            heading, sep, tail = trimmed.partition(":")
+            if not sep:
+                continue
+            label_lc = heading.strip().lower()
+            if label_lc not in keyed_labels:
+                continue
+            cleaned_tail = tail.strip()
+            lc_tail = cleaned_tail.lower()
+            if lc_tail in {"not visible", "nv", "---", ""}:
+                continue
+            description_pick = cleaned_tail[:520]
+            break
+
+    return ParsedInvoiceFields(
+        amount=amount_pick,
+        structured_amount=structured_amount,
+        structured_currency_hint=structured_currency_hint or "",
+        heuristic_amount=heuristic_amount,
+        heuristic_currency=heuristic_currency,
+        merchant=merchant_pick,
+        date=date_pick,
+        description=description_pick,
+    )
+
+
+def resolve_currency_for_merged_amount(
+    amount: Optional[float],
+    tess_blob: str,
+    tess_pf: ParsedInvoiceFields,
+    vlm_blob: str,
+    vlm_pf: ParsedInvoiceFields,
+) -> str:
+    """Elige moneda según qué pipeline aportó el monto final."""
+    combined_lc = (tess_blob + "\n" + vlm_blob).lower()
+
+    def _amount_matches_source(src: Optional[float]) -> bool:
+        if amount is None or amount <= 0 or src is None:
+            return False
+        return abs(src - amount) < 0.02
+
+    sc: Optional[str] = None
+    hc: Optional[str] = None
+
+    if _amount_matches_source(tess_pf.amount):
+        sc = (
+            tess_pf.structured_currency_hint.strip()
+            if tess_pf.structured_amount is not None
+            and tess_pf.structured_amount > 0
+            and tess_pf.structured_currency_hint.strip()
+            else None
+        )
+        hc = (
+            tess_pf.heuristic_currency.strip()
+            if tess_pf.heuristic_amount is not None
+            and tess_pf.heuristic_currency.strip()
+            and tess_pf.heuristic_amount > 0
+            else None
+        )
+    elif _amount_matches_source(vlm_pf.amount):
+        sc = (
+            vlm_pf.structured_currency_hint.strip()
+            if vlm_pf.structured_amount is not None
+            and vlm_pf.structured_amount > 0
+            and vlm_pf.structured_currency_hint.strip()
+            else None
+        )
+        hc = (
+            vlm_pf.heuristic_currency.strip()
+            if vlm_pf.heuristic_amount is not None
+            and vlm_pf.heuristic_currency.strip()
+            and vlm_pf.heuristic_amount > 0
+            else None
+        )
+
+    return resolve_invoice_currency(combined_lc, sc, hc)
+
+
 def is_low_signal_vlm_answer(raw: str) -> bool:
     """
     Moondream a veces responde con metalenguaje en inglés tipo "[Note: ...]"
@@ -228,6 +387,89 @@ def is_low_signal_vlm_answer(raw: str) -> bool:
     return False
 
 
+_ECHO_LINE_FILTERS = (
+    re.compile(r"(?i)en la foto"),
+    re.compile(r"(?i)instrucciones m[ií]nimas"),
+    re.compile(r"(?i)\breformato\b"),
+    re.compile(r"(?i)paso cr[ií]tico"),
+    re.compile(r"(?i)rules reminder"),
+    re.compile(r"(?i)english summary"),
+    re.compile(r"(?i)no esquir"),
+    re.compile(r"(?i)^\s*\d+\.\s*EN LA FOTO"),
+)
+
+
+def looks_like_prompt_echo(text: str) -> bool:
+    """
+    El VLM 0.5b repetía trozos del prompt largo (listas numeradas, “español + inglés”).
+    Si detectamos ese patrón, filtramos líneas antes de extraer montos.
+    """
+    low = text.lower()
+    spam_cues = (
+        "en la foto (español",
+        "instrucciones mínimas",
+        "instrucciones minimas",
+        "paso crítico (español",
+        "rules reminder",
+    )
+    if any(m in low for m in spam_cues):
+        return True
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return False
+    echo_hits = sum(
+        1
+        for ln in lines
+        if any(rx.search(ln) for rx in _ECHO_LINE_FILTERS)
+    )
+    return echo_hits >= max(2, len(lines) // 3)
+
+
+def filter_echo_lines_for_parsing(text: str) -> str:
+    """Dejar solo líneas que parezcan texto fiscal, no eco del prompt."""
+    kept: list[str] = []
+    for line in text.splitlines():
+        if any(rx.search(line) for rx in _ECHO_LINE_FILTERS):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def is_degenerate_vlm_transcript(text: str) -> bool:
+    """
+    Moondream a veces devuelve casi nada (p. ej. " 1.") y los regex extraen amount=1.0.
+    Sin letras suficientes no puede ser un ticket leíble.
+    """
+    s = (text or "").strip()
+    if len(s) == 0:
+        return True
+
+    letters = sum(1 for c in s if c.isalpha())
+    if len(s) < 10 and letters < 2:
+        return True
+
+    if len(s) < 80 and letters < 3 and re.fullmatch(
+        r"[\d\s\.,:$€£\-Bs]+", s, re.IGNORECASE
+    ):
+        return True
+
+    if len(s) <= 12 and re.fullmatch(r"\d{1,6}\.?\d*", s.replace(" ", "")):
+        return True
+
+    return False
+
+
+def vlm_output_unreliable_for_scoring(raw: str) -> bool:
+    """Combina alucinaciones meta + eco del prompt largo (0.5b)."""
+    if is_low_signal_vlm_answer(raw):
+        return True
+    if looks_like_prompt_echo(raw):
+        return True
+    if is_degenerate_vlm_transcript(raw):
+        return True
+    return False
+
+
 def parse_money_fragment(fragment: str) -> tuple[Optional[float], str]:
     """
     Interpreta números con coma/punto americanos y estilo VE (miles por punto,
@@ -245,12 +487,12 @@ def parse_money_fragment(fragment: str) -> tuple[Optional[float], str]:
         re.IGNORECASE,
     )
     if not numeric:
-        return None, currency or "USD"
+        return None, currency or ""
     candidate = numeric[-1]
     amount = parse_localized_money_token(candidate)
     if amount is None or amount <= 0:
-        return None, currency or "USD"
-    return amount, currency or "USD"
+        return None, currency or ""
+    return amount, currency or ""
 
 
 def parse_localized_money_token(token: str) -> Optional[float]:
@@ -304,6 +546,13 @@ def parse_localized_money_token(token: str) -> Optional[float]:
 
 
 def _infer_currency_near_amount(fragment_lower: str) -> str:
+    # "Bg" junto a importe tipo VE: Tesseract suele confundir Bs/G en tickets
+    if re.search(
+        r"\bbg\s*[\d]{1,3}(?:[.,][\d]{3})*(?:[.,]\d{1,4})?",
+        fragment_lower,
+        re.I,
+    ):
+        return "BS"
     if re.search(r"(bs\.?|bol[ií]v|ves\b)", fragment_lower, re.I):
         return "BS"
     if re.search(r"(usd|\$)", fragment_lower, re.I):
@@ -369,7 +618,7 @@ def extract_structured_fields(text: str) -> tuple[
             amt2, curr2 = parse_money_fragment(chunk)
             if amt2 is not None and amt2 > 0:
                 amount = amt2
-                currency_found = curr2 or currency_found or "USD"
+                currency_found = (curr2 or currency_found).strip()
 
         elif key in ("items_en", "items_es", "desc"):
             stripped_meta = strip_trailing_instructions(chunk)
@@ -413,6 +662,8 @@ def extract_amount_from_text(text: str) -> tuple[Optional[float], str]:
     Extrae el monto más probable del texto sin romper formato venezolano (punto=miles).
     Combina TOTAL / palabras clave y captura cercana a símbolo Bs ó $.
     """
+    if is_degenerate_vlm_transcript(text):
+        return None, infer_currency_hint_from_context(text.lower()) or "USD"
     currency_seen = infer_currency_hint_from_context(text.lower())
 
     for pattern in (
@@ -430,23 +681,46 @@ def extract_amount_from_text(text: str) -> tuple[Optional[float], str]:
         cand_text = chunks[-1].group(1).strip()
         amt_ok, curr = parse_money_fragment(cand_text)
         if amt_ok is not None:
-            cur_out = (curr.strip() if curr else "") or currency_seen or "USD"
-            return amt_ok, cur_out or "USD"
+            cur_out = (curr.strip() if curr else "") or currency_seen
+            if not cur_out.strip():
+                cur_out = infer_currency_hint_from_context(text.lower()) or "USD"
+            return amt_ok, cur_out
 
     stray_amt, stray_cur = parse_money_fragment(text)
     fallback_cur = infer_currency_hint_from_context(text.lower()) or "USD"
     if stray_amt is None:
         return None, fallback_cur
-    return stray_amt, (stray_cur or currency_seen or fallback_cur)
+    merged = (stray_cur or currency_seen or fallback_cur).strip()
+    return stray_amt, merged or "USD"
+
+
+def dominant_bs_signal(low: str) -> bool:
+    """
+    Tickets venezolanos repiten Bs en ítems; sin $ explícito no forzamos USD
+    aunque un fragmento numérico quedara sin etiqueta.
+    """
+    if len(re.findall(r"(?i)\bbs\.?\s*[\d]", low)) >= 2:
+        return True
+    if len(re.findall(r"(?i)\bbs\.?\b", low)) >= 3:
+        return True
+    if re.search(r"(?i)(bol[ií]var(es)?|\bves\b|tasa\s+bcu|[\s,;]bcu\b)", low):
+        if not re.search(r"(?i)\busd\b", low) and "$" not in low:
+            return True
+    if re.search(r"(?i)\bbg\s*[\d]{1,3}(?:[.,][\d]{3})*(?:[.,]\d{1,4})?", low):
+        if re.search(r"(?i)\bbs\.?", low):
+            return True
+    return False
 
 
 def infer_currency_hint_from_context(low: str) -> str:
     """Heurística laxa cuando el modelo no etiqueta moneda cerca del monto."""
-    if re.search(r"\bbs(?:\.|,|\s)?", low):
+    if dominant_bs_signal(low):
+        return "BS"
+    if re.search(r"(?i)\bbs(?:\.|,|\s)?", low):
         return "BS"
     if re.search(r"\bbol[ií]v", low):
         return "BS"
-    if re.search(r"\busd\b", low) or "$" in low:
+    if re.search(r"(?i)\busd\b", low) or "$" in low:
         return "USD"
     return ""
 
@@ -455,13 +729,17 @@ def resolve_invoice_currency(raw_text_lc: str, *candidates: Optional[str]) -> st
     for picked in candidates:
         if isinstance(picked, str) and picked.upper() == "BS":
             return "BS"
+    doc_hint = infer_currency_hint_from_context(raw_text_lc)
+    if doc_hint == "BS":
+        return "BS"
     for cand2 in candidates:
         if cand2:
             trimmed = cand2.strip()
             if trimmed:
                 return trimmed.upper()
-    hint = infer_currency_hint_from_context(raw_text_lc)
-    return hint if hint else "USD"
+    if doc_hint:
+        return doc_hint
+    return "USD"
 
 
 
@@ -522,6 +800,8 @@ def extract_merchant_from_text(text: str) -> Optional[str]:
     for line_clean in lines[:14]:
         lc = line_clean.lower()
         if "[note" in lc or "not visible" in lc or lc.startswith(("unable", "cannot")):
+            continue
+        if lc.startswith("reformato"):
             continue
         if label_rx.match(line_clean):
             continue
@@ -586,6 +866,9 @@ def calculate_confidence(
     merchant: Optional[str],
     raw_text: str,
     description: Optional[str],
+    *,
+    tess_text: Optional[str] = None,
+    vlm_text: Optional[str] = None,
 ) -> float:
     score = 0.0
 
@@ -598,25 +881,63 @@ def calculate_confidence(
     if description:
         score += 0.05
 
-    # Bonus sólo ante transcripciones ricas; antes un párrafo “Note:” alto valía igual que OCR real.
-    transcript_signal = invoice_transcript_bonus_ok(raw_text) and (
-        not is_low_signal_vlm_answer(raw_text)
+    tess_body = tess_text or ""
+    tess_chars = len(tess_body.strip())
+    tess_letters = sum(1 for c in tess_body if c.isalpha())
+    tess_strong = tess_chars >= 90 or (
+        tess_chars >= 40 and tess_letters >= 14
     )
+
+    vlm_for_gate = vlm_text if vlm_text is not None else raw_text
+    vlm_unreliable = vlm_output_unreliable_for_scoring(vlm_for_gate)
+
+    if tess_strong:
+        transcript_signal = True
+    else:
+        transcript_signal = invoice_transcript_bonus_ok(raw_text) and (
+            not vlm_unreliable
+        )
+
     if transcript_signal:
         score += 0.1
 
     return min(score, 1.0)
 
 
-INVOICE_VLM_PROMPT = """Lee la foto de una factura, ticket comercial o nota fiscal REAL.
+def build_hybrid_raw_text(tesseract_text: str, moondream_text: str) -> str:
+    """Respuesta API: texto Tesseract + Moondream, secciones claras para depuración."""
+    chunks: list[str] = []
+    tt = (tesseract_text or "").strip()
+    md = (moondream_text or "").strip()
+    if tt:
+        chunks.append(f"# Tesseract (OCR)\n{tt}")
+    if md:
+        chunks.append(f"# Moondream (VLM)\n{md}")
+    if chunks:
+        return "\n\n".join(chunks)
+    return tt or md or ""
+
+
+TRANSCRIBE_RECEIPT_PROMPT = """Copia exactamente el texto impreso del comprobante en la imagen (ticket o factura).
+
+Reglas estrictas:
+— Una línea en papel = una línea en tu respuesta; sin numeración de pasos.
+— Escribe sólo lo que lees en el papel (nombres, RIF, fechas, montos, TOTAL).
+— No describas la imagen. No digas "en la foto". No uses inglés salvo si ya viene en el ticket.
+— No inventes líneas. Si una línea es ilegible, pon: [ilegible]
+— Si el ticket es legible, escribe varias líneas (cabecera, total, etc.); nunca respondas sólo un dígito o "1.".
+FIN."""
+
+
+_LEGACY_LONG_PROMPT = """Lee la foto de una factura, ticket comercial o nota fiscal REAL.
 
 PASO CRÍTICO (español + instrucciones mínimas en inglés):
 
 1. Antes que nada TRANSCRIBE el texto impreso (negocio, dirección corta si ayuda a identificar la tienda,
    número de documento cuando exista y el TOTAL FINAL). No improvises historia ni descripciones
-   tipo “hay varias líneas”.
+   tipo "hay varias líneas".
 
-2. NUNCA uses frases tipo “cannot read”, “[Note:]”, “the exact content is not visible” ni disculpas meta.
+2. NUNCA uses frases tipo "cannot read", "[Note:]", "the exact content is not visible" ni disculpas meta.
    Si algo no existe en papel, pon NOT VISIBLE en la línea exacta solicitada más abajo.
 
 3. FINAL OUTPUT (copia estos encabezados tal cual):
@@ -626,15 +947,23 @@ DATE:
 MERCHANT:
 ITEMS:
 
-Formato después de TOTAL: incluye símbolo o moneda (ej. “Bs 60.552,00”).
+Formato después de TOTAL: incluye símbolo o moneda (ej. "Bs 60.552,00").
 DATE acepta el formato DD/MM/AAAA que veas escrito exactamente igual.
 MERCHANT debe ser razón social o nombre comercial real (no texto genérico).
-ITEMS: máximo tres ítems o “NOT VISIBLE”.
-
-RULES REMINDER:
-
-• English summary: behave like OCR + bookkeeping — copy numbers from the slip, forbid editorial notes.
+ITEMS: máximo tres ítems o "NOT VISIBLE".
 """
+
+
+def pick_invoice_vlm_prompt() -> str:
+    """
+    Por defecto sólo transcripción: el modelo 0.5b copiaba listas numeradas del prompt largo.
+
+    OCR_VLM_PROMPT_MODE=legacy recupera el prompt estructurado (riesgo de eco del prompt).
+    """
+    mode = os.getenv("OCR_VLM_PROMPT_MODE", "transcribe").strip().lower()
+    if mode in ("legacy", "structured", "long"):
+        return _LEGACY_LONG_PROMPT
+    return TRANSCRIBE_RECEIPT_PROMPT
 
 
 @app.post("/parse-invoice", response_model=ParseInvoiceResponse)
@@ -670,94 +999,76 @@ async def parse_invoice(file: UploadFile = File(..., description="Imagen de la f
         vlm = get_moondream_model()
         image_for_model = resize_image_if_too_large(image)
 
-        def _invoke_moondream_parsing():
-            """Evita trabar FastAPI cuando query() síncrono tarda sobre CPU ONNX."""
-            return vlm.query(image_for_model, INVOICE_VLM_PROMPT)
+        def _invoke_moondream_parsing() -> object:
+            return vlm.query(image_for_model, pick_invoice_vlm_prompt())
 
-        query_result = await asyncio.to_thread(_invoke_moondream_parsing)
-        raw_text = (
+        tess_text, query_result = await asyncio.gather(
+            asyncio.to_thread(run_tesseract_ocr, image_for_model),
+            asyncio.to_thread(_invoke_moondream_parsing),
+        )
+
+        vlm_raw = (
             query_result.get("answer", "")
             if isinstance(query_result, dict)
             else str(query_result)
         )
 
-        log_snippet = re.sub(r"\s+", " ", raw_text.strip())[:_LOG_RAW_CHARS]
-        _logger.info("Moondream answer (primeros caracteres=%s): %s", len(raw_text), log_snippet)
-
-        (
-            structured_amount,
-            structured_currency_hint,
-            structured_merchant,
-            structured_date,
-            structured_items,
-        ) = extract_structured_fields(raw_text)
-
-        heuristic_amount, heuristic_currency = extract_amount_from_text(raw_text)
-
-        amount_pick: Optional[float] = (
-            structured_amount
-            if structured_amount is not None and structured_amount > 0
-            else heuristic_amount
+        _logger.info(
+            "OCR híbrido: Tesseract %d chars, Moondream %d chars",
+            len(tess_text.strip()),
+            len(vlm_raw.strip()),
         )
+        md_log = re.sub(r"\s+", " ", vlm_raw.strip())[:_LOG_RAW_CHARS]
+        _logger.info("Moondream (primeros chars): %s", md_log)
 
-        raw_lc_compact = raw_text.lower()
-
-        structured_cur_pick = (
-            structured_currency_hint.strip()
-            if (
-                structured_amount is not None
-                and structured_amount > 0
-                and structured_currency_hint.strip()
+        filtered_vlm = filter_echo_lines_for_parsing(vlm_raw)
+        if looks_like_prompt_echo(vlm_raw):
+            vlm_parse_blob = filtered_vlm
+        else:
+            vlm_parse_blob = (
+                filtered_vlm if len(filtered_vlm.strip()) >= 4 else vlm_raw
             )
-            else None
+
+        tess_blob = tess_text.strip()
+        tess_pf = parse_invoice_text_blob(tess_blob)
+        vlm_pf = parse_invoice_text_blob(vlm_parse_blob)
+
+        amount_pick = tess_pf.amount or vlm_pf.amount
+        merchant_pick = tess_pf.merchant or vlm_pf.merchant
+        date_pick = tess_pf.date or vlm_pf.date
+        description_pick = tess_pf.description or vlm_pf.description
+
+        currency_pick = resolve_currency_for_merged_amount(
+            amount_pick,
+            tess_blob,
+            tess_pf,
+            vlm_parse_blob,
+            vlm_pf,
         )
-        heuristic_cur_pick = (
-            heuristic_currency.strip()
-            if (
-                heuristic_amount is not None
-                and heuristic_currency.strip()
-                and heuristic_amount > 0
-            )
-            else None
+
+        hybrid_raw = build_hybrid_raw_text(tess_text, vlm_raw)
+
+        tess_ok = tess_transcript_is_substantial(tess_blob)
+        vlm_garbage = (
+            (looks_like_prompt_echo(vlm_raw) and len(vlm_parse_blob.strip()) < 40)
+            or is_degenerate_vlm_transcript(vlm_raw)
+            or is_degenerate_vlm_transcript(vlm_parse_blob)
         )
 
-        currency_pick = resolve_invoice_currency(
-            raw_lc_compact,
-            structured_cur_pick,
-            heuristic_cur_pick,
-        )
-
-        merchant_pick = structured_merchant or extract_merchant_from_text(raw_text)
-        date_pick = structured_date or extract_date_from_text(raw_text)
-
-        description_pick: Optional[str] = structured_items
-        if description_pick is None:
-            keyed_labels = frozenset({"items", "description", "productos", "articulos"})
-            for line in raw_text.split("\n"):
-                trimmed = line.strip()
-                if ":" not in trimmed:
-                    continue
-                heading, sep, tail = trimmed.partition(":")
-                if not sep:
-                    continue
-                label_lc = heading.strip().lower()
-                if label_lc not in keyed_labels:
-                    continue
-
-                cleaned_tail = tail.strip()
-                lc_tail = cleaned_tail.lower()
-                if lc_tail in {"not visible", "nv", "---", ""}:
-                    continue
-
-                description_pick = cleaned_tail[:520]
-                break
+        if (not tess_ok) and vlm_garbage:
+            amount_pick = None
+            merchant_pick = None
+            date_pick = None
+            description_pick = None
 
         confidence = calculate_confidence(
             amount_pick,
             date_pick,
             merchant_pick,
-            raw_text,
+            hybrid_raw,
             description_pick,
+            tess_text=tess_text,
+            vlm_text=vlm_raw,
         )
 
         return ParseInvoiceResponse(
@@ -765,7 +1076,7 @@ async def parse_invoice(file: UploadFile = File(..., description="Imagen de la f
             date=date_pick,
             merchant=merchant_pick,
             description=description_pick,
-            raw_text=raw_text,
+            raw_text=hybrid_raw,
             confidence=confidence,
             currency=currency_pick,
         )

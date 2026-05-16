@@ -21,11 +21,10 @@ services:
       PORT: "8001"
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      # VRAM limitada (p. ej. Quadro P600 2GB): mantener 0.5b; 2b puede fallar por memoria
-      MOONDREAM_ONNX_VARIANT: "0.5b"
+      # Por defecto 2b (mejor VLM). VRAM/RAM justa: export MOONDREAM_ONNX_VARIANT=0.5b o fija "0.5b" aquí
+      MOONDREAM_ONNX_VARIANT: "${MOONDREAM_ONNX_VARIANT:-2b}"
       # MOONDREAM_API_KEY: ""           # alternativa: nube, sin pesos locales
       # MOONDREAM_MODEL_PATH: ""        # o .mf/.gz ya descargado (montar volumen)
-      # MOONDREAM_ONNX_VARIANT: "0.5b"  # recomendado en GPUs con poca VRAM (p. ej. 2GB)
       # HF_HOME ya es /var/cache/huggingface en el Dockerfile
     # Variables extra: copia .env.example → .env en esta carpeta o define aquí bajo `environment`.
     volumes:

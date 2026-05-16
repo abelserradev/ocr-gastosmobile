@@ -1,13 +1,14 @@
 # syntax=docker/dockerfile:1
-# Imagen OCR (Moondream ONNX).
-# USE_GPU=1 solo si el DESPLIEGUE monta NVIDIA Container Toolkit + imagen CUDA (libcublas, etc.);
-# por defecto CPU (silenciosa: sin intentos de cargar libonnxruntime_providers_cuda.so).
 FROM python:3.12-slim-bookworm
 
 ARG USE_GPU=0
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends libgomp1 \
+  && apt-get install -y --no-install-recommends \
+     libgomp1 \
+     tesseract-ocr \
+     tesseract-ocr-spa \
+     tesseract-ocr-eng \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -27,7 +28,6 @@ COPY src/ ./src/
 
 ENV PORT=8001
 ENV PYTHONUNBUFFERED=1
-# Caché Hugging Face (montar volumen en compose para no re-descargar en cada recreación)
 ENV HF_HOME=/var/cache/huggingface
 
 EXPOSE 8001
