@@ -4,8 +4,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        USE_GPU: "${USE_GPU:-1}"
+      # Imagen con CUDA 12 + cuDNN (libcublasLt); sin esto onnxruntime-gpu cae a CPU con error en logs
+      target: "${OCR_DOCKER_TARGET:-gpu}"
     image: gastos-ocr:local
     container_name: gastos-ocr
     ports:
