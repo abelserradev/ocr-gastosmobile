@@ -1,18 +1,19 @@
 # Servicio OCR - Gastos
 
-Servicio Python (FastAPI) para extracción de datos de facturas usando **Moondream** (vision-language model local).
+Servicio Python (FastAPI) para facturas: **Tesseract** + **Moondream** (híbrido, texto legible en `raw_text`).
 
 ## ¿Qué hace?
 
 - Recibe imágenes de facturas (JPG, PNG, WebP)
+- **Híbrido:** **Tesseract** (OCR clásico, `spa+eng`) + **Moondream** (VLM); los campos se fusionan con **preferencia por Tesseract** cuando aporta texto sustancial
 - Extrae: **monto**, **fecha**, **comercio**, **descripción**
-- Retorna JSON estructurado con nivel de confianza
+- En la respuesta, `raw_text` combina ambas fuentes con cabeceras `# Tesseract (OCR)` y `# Moondream (VLM)` para depuración
 
 ## Requisitos
 
 - Python 3.10+
-- ~4GB RAM (Moondream corre en CPU)
-- GPU opcional (CUDA para velocidad)
+- ~4GB RAM (Moondream + Tesseract en CPU)
+- **Tesseract** en el sistema: en Docker ya se instala (`tesseract-ocr`, `spa`/`eng`); en local: `sudo apt install tesseract-ocr tesseract-ocr-spa tesseract-ocr-eng` (Debian/Ubuntu)
 
 ## Instalación
 
@@ -33,6 +34,38 @@ python src/main.py
 uvicorn src.main:app --host 0.0.0.0 --port 8001 --reload
 ```
 
+## Docker local (`docker-compose.local.yml`)
+
+En el repo hay un compose pensado para desarrollo en tu PC:
+
+```bash
+cd ocr/
+docker compose -f docker-compose.local.yml up --build
+```
+
+Usa **`USE_GPU=0`** (inferencia en **CPU** dentro del contenedor). Las GPUs **AMD** (p. ej. RX 580) **no ejecutan CUDA** (CUDA es de NVIDIA); el paquete `onnxruntime-gpu` de esta imagen está orientado a NVIDIA. ROCm en AMD es otro stack y Polaris/RX 580 suele quedar mal soportado para este pipeline. Los detalles están comentados en `docker-compose.local.yml`.
+
+### Verificación local (antes de desplegar al servidor)
+
+1. Levantá el stack y esperá a que el health sea estable (la primera vez Moondream descarga pesos; puede tardar minutos).
+2. Ejecutá el script (health + factura opcional):
+
+```bash
+cd ocr/
+chmod +x scripts/verify-local.sh   # una vez
+./scripts/verify-local.sh
+VERIFY_INVOICE_IMAGE=/ruta/a/tu-factura.jpg ./scripts/verify-local.sh
+```
+
+Variables opcionales: `OCR_BASE_URL` si el puerto no es 8001.
+
+3. **Criterios de aprobación** (revisión manual del JSON):
+   - `amount` / `merchant` / `currency` coherentes con el ticket.
+   - `raw_text` incluye `# Tesseract (OCR)` con líneas legibles; Moondream puede ser auxiliar.
+   - `confidence` acorde (no forzar si el ticket es ilegible).
+
+4. Misma imagen Docker / mismas variables en producción → despliegue alineado con lo probado localmente.
+
 ## Docker (NVIDIA GPU en el host)
 
 El servicio vive en esta carpeta (`ocr/`). El código Nest que llama al OCR está en `backend/src/ocr/` (no es este contenedor).
@@ -46,8 +79,11 @@ docker compose up --build -d
 ```
 
 - Caché de Hugging Face en el volumen `huggingface_ocr_cache` (no re-descarga el `.mf.gz` en cada `docker compose down` sin `-v`).
-- **`MOONDREAM_ONNX_VARIANT=0.5b`** recomendable si la GPU tiene poca VRAM (p. ej. 2GB): añádelo bajo `environment` en `docker-compose.yml` o en un `.env` junto al compose.
-- **Solo CPU:** comenta `gpus: all` en `docker-compose.yml` y ejecuta `docker compose build --build-arg USE_GPU=0` antes del `up`.
+- **`MOONDREAM_ONNX_VARIANT=0.5b`** recomendable si la GPU tiene poca VRAM (p. ej. 2GB): variable de entorno en Coolify o `.env`.
+- **GPU (servidor NVIDIA):** `build.target: gpu` usa la misma base **slim** + `onnxruntime-gpu` y wheels `nvidia-cublas-cu12` (evita descargar ~2 GB de `nvidia/cuda` en cada deploy de Coolify). Sigue necesitando `deploy.resources` / `--gpus all` y drivers en el host.
+- **Coolify build cortado al 50–90 s:** suele ser timeout o disco al bajar `nvidia/cuda`; con el Dockerfile actual el build es mucho más pequeño. Si falla igual, sube el timeout de build en Coolify o haz `docker compose build` por SSH en el servidor.
+- **Solo CPU:** `OCR_DOCKER_TARGET=cpu` en el build o `docker-compose.local.yml` (`target: cpu`) y comenta `deploy.resources.reservations.devices`.
+- **Coolify + GPU:** si el validador falla con `deploy`, Custom Docker Options: `--gpus all`. Rebuild sin caché tras cambiar el Dockerfile.
 - **Cloudflare:** el proxy naranja corta ~100s; inferencias largas pueden necesitar DNS only, async job o API Moondream en nube (`MOONDREAM_API_KEY`).
 
 ## Endpoints
@@ -55,7 +91,7 @@ docker compose up --build -d
 | Método | Endpoint | Descripción |
 |--------|----------|-------------|
 | POST | `/parse-invoice` | Recibe imagen multipart, retorna datos extraídos |
-| GET | `/health` | Health check, indica si modelo está cargado |
+| GET | `/health` | Comprueba el servicio; `model_loaded` true cuando Moondream ya está en memoria; `precache_finished` / `precache_error` ayudan a diagnosticar la precarga en segundo plano |
 
 ## Ejemplo de uso (curl)
 

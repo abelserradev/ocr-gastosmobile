@@ -1,0 +1,67 @@
+# Compose local — carpeta ocr/
+#
+# === GPU AMD (p. ej. Radeon RX 580) y “CUDA” ===
+# - CUDA es de NVIDIA. Una RX 580 NO ejecuta CUDA; OpenCL/Vulkan ≠ CUDA.
+# - Este Dockerfile con USE_GPU=1 instala onnxruntime-gpu (binarios CUDA). Eso solo
+#   aplica a GPUs NVIDIA + drivers + nvidia-container-toolkit en el host.
+# - ROCm sería la ruta AMD en Linux; Polaris/RX 580 suele quedar fuera o mal soportada,
+#   y el wheel estándar de moondream/onnxruntime no es “rocm install” como CUDA.
+# Conclusión práctica: en contenedor, dejamos Moondream en CPU (USE_GPU=0), estable.
+# Si en otro equipo tienes NVIDIA, puedes build con USE_GPU=1 y descomentar `gpus:` abajo.
+#
+# Uso:
+#   cd ocr && docker compose -f docker-compose.local.yml up --build
+#   curl -s http://127.0.0.1:8001/health
+#
+# Opcional: copia .env.example → .env y ajusta variables (sin commitear secretos).
+
+services:
+  ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: cpu
+    image: gastos-ocr:local
+    container_name: gastos-ocr-local
+    ports:
+      - "${OCR_PORT:-8001}:8001"
+    environment:
+      PORT: "8001"
+      # 2b = mejor calidad VLM (más RAM/CPU). Para equipos justos: MOONDREAM_ONNX_VARIANT=0.5b en .env
+      MOONDREAM_ONNX_VARIANT: "${MOONDREAM_ONNX_VARIANT:-2b}"
+      OCR_VLM_PROMPT_MODE: "${OCR_VLM_PROMPT_MODE:-transcribe}"
+      # Opcional: crea ocr/.env desde .env.example y usa:
+      #   docker compose -f docker-compose.local.yml --env-file .env up --build
+
+    volumes:
+      - huggingface_ocr_cache_local:/var/cache/huggingface
+    restart: "no"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
+volumes:
+  huggingface_ocr_cache_local:
+
+# --- Solo si el host tiene GPU NVIDIA + Docker con soporte GPU:
+#    docker compose -f docker-compose.local.yml build --build-arg USE_GPU=1
+#    y en el servicio:
+#    deploy:
+#      resources:
+#        reservations:
+#          devices:
+#            - driver: nvidia
+#              count: all
+#              capabilities: [gpu]
+# O en Compose v2 antiguo: `gpus: all` bajo `ocr:`.
+#
+# AMD/ROCm: no usar este bloque tal cual; requeriría imagen base y paquetes distintos.
