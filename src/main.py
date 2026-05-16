@@ -5,6 +5,7 @@ Usa Moondream para vision-language local y extracción de información.
 
 import asyncio
 import io
+import logging
 import os
 import re
 import threading
@@ -22,6 +23,10 @@ from moondream.types import VLM
 
 # Revisión fijada: empaquetados .mf.gz usados en PyPI moondream 0.0.5; si HF deja de servirla, definir MOONDREAM_HF_REVISION.
 DEFAULT_MOONDREAM_MF_REVISION = "9dddae84d54db4ac56fe37817aeaeb502ed083e2"
+
+_logger = logging.getLogger("ocr")
+if not logging.root.handlers:
+    logging.basicConfig(level=os.getenv("OCR_LOG_LEVEL", "INFO").upper())
 
 _moondream_vlm: Optional[VLM] = None
 _moondream_lock = threading.Lock()
@@ -112,7 +117,11 @@ async def _precargar_moondream_en_fondo() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    asyncio.create_task(_precargar_moondream_en_fondo())
+    setattr(
+        _app.state,
+        "moondream_warm_task",
+        asyncio.create_task(_precargar_moondream_en_fondo()),
+    )
     yield
 
 
@@ -178,44 +187,283 @@ class HealthResponse(BaseModel):
     )
 
 
+MAX_OCR_IMAGE_SIDE = max(768, min(4096, int(os.getenv("OCR_MAX_IMAGE_SIDE", "1600"))))
+_LOG_RAW_CHARS = max(120, min(4000, int(os.getenv("OCR_LOG_RAW_MAX_CHARS", "600"))))
+
+
+def resize_image_if_too_large(image: Image.Image) -> Image.Image:
+    """Algunos VLM mejoran si el lado largo no supera OCR_MAX_IMAGE_SIDE (memoria + texto legible)."""
+    width, height = image.size
+    longest = max(width, height)
+    if longest <= MAX_OCR_IMAGE_SIDE:
+        return image
+    ratio = MAX_OCR_IMAGE_SIDE / longest
+    new_size = max(1, int(width * ratio)), max(1, int(height * ratio))
+    return image.resize(new_size, Image.Resampling.LANCZOS)
+
+
+def is_low_signal_vlm_answer(raw: str) -> bool:
+    """
+    Moondream a veces responde con metalenguaje en inglés tipo "[Note: ...]"
+    cuando en realidad no transcribe la foto; no debemos puntear eso como "texto OCR bueno".
+    """
+    condensed = raw.lower().strip()
+    if len(condensed) < 15:
+        return True
+    bad_markers = (
+        "[note:",
+        "cannot read",
+        "can't read",
+        "can not see",
+        "exact content is not visible",
+        "image is blurry",
+        "no visible text",
+        "unable to ",
+        "i cannot ",
+    )
+    if any(m in condensed for m in bad_markers):
+        return True
+    if condensed.startswith("[") and "note" in condensed[:80]:
+        return True
+    return False
+
+
+def parse_money_fragment(fragment: str) -> tuple[Optional[float], str]:
+    """
+    Interpreta números con coma/punto americanos y estilo VE (miles por punto,
+    decimal por coma): Bs 60.552,00 ó 60552,00.
+    """
+    s = fragment.strip()
+    currency = _infer_currency_near_amount(s.lower())
+
+    s = re.sub(r"(?i)\b(bs\.?|ves|usd)\b\s*", "", s)
+    s = s.replace("$", "").replace("\u2009", "").replace(" ", "").strip()
+
+    numeric = re.findall(
+        r"[\d]{1,3}(?:[\.,]\d{3})+(?:[\.,]\d{1,4})?|\d+(?:[\.,]\d+)?",
+        s,
+        re.IGNORECASE,
+    )
+    if not numeric:
+        return None, currency or "USD"
+    candidate = numeric[-1]
+    amount = parse_localized_money_token(candidate)
+    if amount is None or amount <= 0:
+        return None, currency or "USD"
+    return amount, currency or "USD"
+
+
+def parse_localized_money_token(token: str) -> Optional[float]:
+    normalized = token.strip()
+    # TODO: Soporte EUR con espacio NBSP si aparece en recibos importados
+
+    decimal_comma_ve = bool(
+        re.match(r"^[\d]{1,3}(?:\.[\d]{3})*,\d{1,4}$", normalized)
+    )
+
+    try:
+        if decimal_comma_ve:
+            main, frac = normalized.rsplit(",", 1)
+            whole = main.replace(".", "")
+            result = float(f"{whole}.{frac}")
+            return result if result > 0 else None
+
+        decimal_dot_us = bool(re.match(r"^[\d,]+\.\d{1,4}$", normalized))
+
+        only_dots = "." in normalized and "," not in normalized
+
+        last_dot_idx = normalized.rfind(".")
+        rest_after_last_dot = (
+            normalized[last_dot_idx + 1 :] if last_dot_idx != -1 else ""
+        )
+
+        ambiguous_dot_as_decimal = bool(
+            only_dots and last_dot_idx != -1 and len(rest_after_last_dot) <= 2
+        )
+
+        if decimal_dot_us or ambiguous_dot_as_decimal:
+            return float(normalized.replace(",", ""))
+
+        if "," in normalized and "." not in normalized:
+            stripped = normalized.replace(",", "")
+            return float(stripped)
+
+        if "." in normalized and "," in normalized:
+            if normalized.rfind(".") > normalized.rfind(","):
+                return float(normalized.replace(",", ""))
+            return parse_localized_money_token(normalized.replace(".", "").replace(",", "."))
+
+        stripped_all = normalized.replace(",", "").replace(".", "")
+        if stripped_all.isdigit():
+            raw_f = float(stripped_all)
+            return raw_f if raw_f > 0 else None
+    except (ValueError, ArithmeticError):
+        return None
+
+    return None
+
+
+def _infer_currency_near_amount(fragment_lower: str) -> str:
+    if re.search(r"(bs\.?|bol[ií]v|ves\b)", fragment_lower, re.I):
+        return "BS"
+    if re.search(r"(usd|\$)", fragment_lower, re.I):
+        return "USD"
+    return ""
+
+
+def extract_structured_fields(text: str) -> tuple[
+    Optional[float], str, Optional[str], Optional[str], Optional[str]
+]:
+    """
+    Prefiere etiquetas TOTAL:/DATE:/MERCHANT: que el prompt pide; evita regex frágiles
+    sobre párrafos libres cuando el modelo colabora.
+    """
+    amount: Optional[float] = None
+    currency_found = ""
+    merchant_f: Optional[str] = None
+    date_str: Optional[str] = None
+    items_chunk: Optional[str] = None
+
+    for rx, key in (
+        (
+            r"(?ims)^TOTAL(?:\s+A\s+PAGAR|\s+PAGADO)?\s*[:\.]?\s*(.+)$",
+            "total",
+        ),
+        (r"(?ims)^DATE\s*[:\.]?\s*(.+)$", "date"),
+        (r"(?ims)^MERCHANT\s*[:\.]?\s*(.+)$", "merchant"),
+        (r"(?ims)^(?:FECHA)\s*[:\.]?\s*(.+)$", "date_es"),
+        (
+            r"(?ims)^(?:COMERCIO|TIENDA|NEGOCIO|RAZÓN\s+SOCIAL)"
+            r"\s*[:\.]?\s*(.+)$",
+            "merchant_es",
+        ),
+        (r"(?ims)^ITEMS\s*[:\.]?\s*(.+)$", "items_en"),
+        (r"(?ims)^ART[IÍ]CULOS\s*[:\.]?\s*(.+)$", "items_es"),
+        (r"(?ims)^(?:DESCRIPCIÓN|DESCRIPCION)\s*[:\.]?\s*(.+)$", "desc"),
+    ):
+        finds = list(re.finditer(rx, text))
+        if not finds:
+            continue
+        last = finds[-1]
+        chunk = last.group(1).strip()
+
+        lowered = chunk.lower()
+        invisible = lowered in {"not visible", "n/a", "na", "", "nv", "---"}
+        visible_no = lowered.startswith(("not visible", "cannot", "unable"))
+        if invisible or visible_no:
+            continue
+
+        if key in ("merchant", "merchant_es"):
+            stripped = strip_trailing_instructions(chunk)
+            if len(stripped) > 2:
+                merchant_f = stripped.strip()
+                if len(merchant_f) > 120:
+                    merchant_f = merchant_f[:120]
+
+        elif key in ("date", "date_es"):
+            normalized = normalize_structured_date_line(chunk)
+            if normalized:
+                date_str = normalized
+
+        elif key == "total":
+            amt2, curr2 = parse_money_fragment(chunk)
+            if amt2 is not None and amt2 > 0:
+                amount = amt2
+                currency_found = curr2 or currency_found or "USD"
+
+        elif key in ("items_en", "items_es", "desc"):
+            stripped_meta = strip_trailing_instructions(chunk)
+            low_meta = stripped_meta.lower()
+            if low_meta.startswith(("not visible", "cannot")):
+                continue
+            cand = stripped_meta.strip()
+            if len(cand) < 4:
+                continue
+            pick = cand if cand else None
+            if pick and (
+                items_chunk is None or len(pick) > len(items_chunk or "")
+            ):
+                items_chunk = pick[:400]
+
+    return amount, currency_found, merchant_f, date_str, items_chunk
+
+
+def normalize_structured_date_line(chunk: str) -> Optional[str]:
+    trimmed = strip_trailing_instructions(chunk)
+    iso = extract_date_from_text(trimmed)
+    return iso
+
+
+def strip_trailing_instructions(fragment: str) -> str:
+    """Quita coma final o texto pegado después de la primera fecha en una línea."""
+    cleaned = fragment.split("(", 1)[0].strip()
+    parts = cleaned.split(",", 1)
+    if parts and looks_like_calendar_bit(parts[0]):
+        candidate = parts[0].strip()
+        return candidate
+    return cleaned.strip()
+
+
+def looks_like_calendar_bit(s: str) -> bool:
+    return bool(re.search(r"\d{1,4}[/\-\.]\d{1,4}[/\-\.]\d{2,4}", s))
+
+
 def extract_amount_from_text(text: str) -> tuple[Optional[float], str]:
     """
-    Extrae el monto más probable del texto.
-    Busca patrones como: $25.50, 25.50 USD, Total: 100, etc.
-    Retorna (monto, moneda_detectada).
+    Extrae el monto más probable del texto sin romper formato venezolano (punto=miles).
+    Combina TOTAL / palabras clave y captura cercana a símbolo Bs ó $.
     """
-    # Patrones comunes para montos
-    patterns = [
-        # Total con símbolo $ o USD al final
-        r'(?:total|monto|amount|importe)[:\s]*[\$\s]*([\d,]+\.?\d*)\s*(?:usd|\$)?',
-        # $XX.XX o XX.XX USD
-        r'\$?\s*([\d,]+\.\d{2})\s*(?:usd|\$)?',
-        # Patrón venezolano: Bs. XX.XXX,XX o XX.XXX,XX Bs.
-        r'(?:bs\.?|bol[ií]vares?)[:\s]*([\d.,]+)\s*(?:bs\.?)?',
-        # Número grande al final (probable total)
-        r'(?:total|pagar)[:\s]*([\d,]+\.?\d*)',
-    ]
+    currency_seen = infer_currency_hint_from_context(text.lower())
 
-    text_clean = text.lower().replace(',', '')
+    for pattern in (
+        r"(?i)(?:total\s+a\s+pagar|total\s+pagado|total\s+factura"
+        r"|monto\s+total|gran\s+total|importe\s+total)\s*[:\.]?\s*([^\n\r]{1,120})",
+        r"(?i)(?:total|importe\s+factura)[:\.]?\s*Bs\.?\s*([\d\s.,]{3,42})",
+        r"(?i)Bs\.?\s*([\d][\d\s.,]{2,41})",
+        r"(?i)\$\s*([\d][\d\s.,]{1,41})",
+        r"(?i)(?:pagar|cambio|cobr(?:ar)?)\s*[:\.]?\s*([^\n\r]{1,96})",
+    ):
+        chunks = list(re.finditer(pattern, text))
+        if not chunks:
+            continue
 
-    for pattern in patterns:
-        matches = re.findall(pattern, text_clean, re.IGNORECASE)
-        if matches:
-            # Tomar el último match (generalmente el total)
-            try:
-                amount_str = matches[-1]
-                # Limpiar y convertir
-                amount_str = amount_str.replace(',', '').strip()
-                # Si tiene punto decimal, asumimos que es decimal
-                amount = float(amount_str)
-                if amount > 0:
-                    # Detectar moneda
-                    currency = "BS" if "bs" in text_clean or "bolívar" in text_clean else "USD"
-                    return amount, currency
-            except ValueError:
-                continue
+        cand_text = chunks[-1].group(1).strip()
+        amt_ok, curr = parse_money_fragment(cand_text)
+        if amt_ok is not None:
+            cur_out = (curr.strip() if curr else "") or currency_seen or "USD"
+            return amt_ok, cur_out or "USD"
 
-    return None, "USD"
+    stray_amt, stray_cur = parse_money_fragment(text)
+    fallback_cur = infer_currency_hint_from_context(text.lower()) or "USD"
+    if stray_amt is None:
+        return None, fallback_cur
+    return stray_amt, (stray_cur or currency_seen or fallback_cur)
+
+
+def infer_currency_hint_from_context(low: str) -> str:
+    """Heurística laxa cuando el modelo no etiqueta moneda cerca del monto."""
+    if re.search(r"\bbs(?:\.|,|\s)?", low):
+        return "BS"
+    if re.search(r"\bbol[ií]v", low):
+        return "BS"
+    if re.search(r"\busd\b", low) or "$" in low:
+        return "USD"
+    return ""
+
+
+def resolve_invoice_currency(raw_text_lc: str, *candidates: Optional[str]) -> str:
+    for picked in candidates:
+        if isinstance(picked, str) and picked.upper() == "BS":
+            return "BS"
+    for cand2 in candidates:
+        if cand2:
+            trimmed = cand2.strip()
+            if trimmed:
+                return trimmed.upper()
+    hint = infer_currency_hint_from_context(raw_text_lc)
+    return hint if hint else "USD"
+
+
 
 
 def extract_date_from_text(text: str) -> Optional[str]:
@@ -223,12 +471,12 @@ def extract_date_from_text(text: str) -> Optional[str]:
     Extrae fecha del texto en formato YYYY-MM-DD.
     Soporta formatos comunes: DD/MM/YYYY, DD-MM-YYYY, etc.
     """
-    # Patrones de fecha
+    # Patrones de fecha (latinos incluyen punto)
     patterns = [
-        # DD/MM/YYYY o DD-MM-YYYY
-        r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})',
-        # YYYY-MM-DD
+        r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})",
+        r"(\d{1,2})\.(\d{1,2})\.(\d{4})",
         r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})',
+        r'(\d{4})\.(\d{1,2})\.(\d{1,2})',
     ]
 
     for pattern in patterns:
@@ -251,61 +499,142 @@ def extract_date_from_text(text: str) -> Optional[str]:
 
 def extract_merchant_from_text(text: str) -> Optional[str]:
     """
-    Extrae el nombre del comercio/establecimiento.
-    Busca líneas que parezcan nombres de negocio.
+    Si el VLM no devolvió MERCHANT: estructurado, tomamos la primera línea “de encabezado”
+    que no sea metadato del formulario.
     """
-    lines = text.strip().split('\n')
+    lines = [ln.strip() for ln in text.strip().split("\n") if ln.strip()]
 
-    # Palabras que indican que NO es el comercio
+    label_rx = re.compile(
+        r"(?ix)^\s*(merchant|fecha|date|total|items|articulos|descripción|descripcion)\s*[:\.]"
+    )
+
     exclude_words = [
-        'factura', 'recibo', 'ticket', 'total', 'subtotal', 'iva',
-        'fecha', 'hora', 'monto', 'cambio', 'efectivo', 'tarjeta',
-        'gracias', 'vuelva', 'pronto', 'cliente', 'cajero',
-        'telefono', 'direccion', 'rif', 'nit'
+        "factura comercial",
+        "factura de venta",
+        "recibo de pago",
+        "subtotal",
+        "iva",
+        "cambio",
+        "gracias",
+        "vuelva pronto",
     ]
 
-    # Buscar primera línea que parezca nombre de negocio
-    for line in lines[:10]:  # Revisar primeras 10 líneas
-        line_clean = line.strip()
-        if len(line_clean) < 3 or len(line_clean) > 50:
+    for line_clean in lines[:14]:
+        lc = line_clean.lower()
+        if "[note" in lc or "not visible" in lc or lc.startswith(("unable", "cannot")):
+            continue
+        if label_rx.match(line_clean):
             continue
 
-        # No debe contener números de documento
-        if re.search(r'\d{3,}', line_clean):
+        chunk_len = len(line_clean)
+        if chunk_len < 4 or chunk_len > 96:
             continue
 
-        # No debe contener palabras excluidas
-        if any(word in line_clean.lower() for word in exclude_words):
+        lowered_all = "".join(lc.split())
+        if any(bad.replace(" ", "") in lowered_all for bad in exclude_words):
             continue
 
-        # Debe tener al menos 2 palabras o ser un nombre propio
-        if len(line_clean.split()) >= 1:
-            return line_clean.title()
+        numeric_density = sum(1 for char in line_clean if char.isdigit())
+        # RIF/control fiscal largos: demasiados dígitos para ser solo razón social
+        if numeric_density >= max(10, chunk_len // 4):
+            continue
+
+        spaced = (
+            line_clean.strip()
+            if any(tag in lc for tag in ["c.a.", "s.a.", ",", ".,"])
+            else line_clean.title()
+        )
+        return spaced
 
     return None
+
+
+def invoice_transcript_bonus_ok(raw_text: str) -> bool:
+    """
+    Solo damos puntos extra cuando el modelo devolvió un bloque rico típico de facturas,
+    pero la heurística de campos quizá no llegó — evita falsos positivos tipo “notes” cortas.
+    """
+    stripped = raw_text.strip()
+    lc = stripped.lower()
+    cues = (
+        "total",
+        "bs.",
+        "bs ",
+        "bolívar",
+        "bolivar",
+        "usd",
+        "importe",
+        "factura",
+        "ticket",
+        "rif",
+        "iva",
+        "$",
+    )
+
+    numeric_spread_ok = bool(
+        re.search(r"\d[\d\s./,-]{10,}", stripped, re.MULTILINE)
+    )
+    lexical_hit = sum(1 for chunk in cues if chunk in lc) >= 1
+    headerish = ("\n" in stripped or stripped.count(":") >= 2)
+    length_ok = len(stripped) >= 110
+    return length_ok and numeric_spread_ok and lexical_hit and headerish
 
 
 def calculate_confidence(
     amount: Optional[float],
     date: Optional[str],
     merchant: Optional[str],
-    raw_text: str
+    raw_text: str,
+    description: Optional[str],
 ) -> float:
-    """Calcula una puntuación de confianza basada en qué tanto extrajimos."""
     score = 0.0
 
     if amount is not None and amount > 0:
-        score += 0.4
+        score += 0.35
     if date is not None:
         score += 0.3
     if merchant is not None:
         score += 0.2
+    if description:
+        score += 0.05
 
-    # Bonus si el texto tiene buena longitud (indica OCR decente)
-    if len(raw_text) > 50:
+    # Bonus sólo ante transcripciones ricas; antes un párrafo “Note:” alto valía igual que OCR real.
+    transcript_signal = invoice_transcript_bonus_ok(raw_text) and (
+        not is_low_signal_vlm_answer(raw_text)
+    )
+    if transcript_signal:
         score += 0.1
 
     return min(score, 1.0)
+
+
+INVOICE_VLM_PROMPT = """Lee la foto de una factura, ticket comercial o nota fiscal REAL.
+
+PASO CRÍTICO (español + instrucciones mínimas en inglés):
+
+1. Antes que nada TRANSCRIBE el texto impreso (negocio, dirección corta si ayuda a identificar la tienda,
+   número de documento cuando exista y el TOTAL FINAL). No improvises historia ni descripciones
+   tipo “hay varias líneas”.
+
+2. NUNCA uses frases tipo “cannot read”, “[Note:]”, “the exact content is not visible” ni disculpas meta.
+   Si algo no existe en papel, pon NOT VISIBLE en la línea exacta solicitada más abajo.
+
+3. FINAL OUTPUT (copia estos encabezados tal cual):
+
+TOTAL:
+DATE:
+MERCHANT:
+ITEMS:
+
+Formato después de TOTAL: incluye símbolo o moneda (ej. “Bs 60.552,00”).
+DATE acepta el formato DD/MM/AAAA que veas escrito exactamente igual.
+MERCHANT debe ser razón social o nombre comercial real (no texto genérico).
+ITEMS: máximo tres ítems o “NOT VISIBLE”.
+
+RULES REMINDER:
+
+• English summary: behave like OCR + bookkeeping — copy numbers from the slip, forbid editorial notes.
+"""
 
 
 @app.post("/parse-invoice", response_model=ParseInvoiceResponse)
@@ -339,54 +668,107 @@ async def parse_invoice(file: UploadFile = File(..., description="Imagen de la f
 
     try:
         vlm = get_moondream_model()
+        image_for_model = resize_image_if_too_large(image)
 
-        # Prompt optimizado para facturas
-        prompt = """Analyze this invoice/receipt image and extract the following information:
-        1. Total amount (look for "Total", "Monto", "Importe", "Amount")
-        2. Date (in any format)
-        3. Merchant/Store name (business name)
-        4. Brief description of items if visible
+        def _invoke_moondream_parsing():
+            """Evita trabar FastAPI cuando query() síncrono tarda sobre CPU ONNX."""
+            return vlm.query(image_for_model, INVOICE_VLM_PROMPT)
 
-        Respond in this exact format:
-        TOTAL: [amount with currency]
-        DATE: [date]
-        MERCHANT: [store name]
-        ITEMS: [brief list]
-
-        If any information is not visible, write "NOT VISIBLE".
-        """
-
-        query_result = vlm.query(image, prompt)
-        raw_text = query_result.get("answer", "") if isinstance(query_result, dict) else str(query_result)
-
-        # Extraer datos estructurados
-        amount, currency = extract_amount_from_text(raw_text)
-        date = extract_date_from_text(raw_text)
-        merchant = extract_merchant_from_text(raw_text)
-
-        # Descripción: líneas que parezcan items
-        description = None
-        lines = raw_text.split('\n')
-        for line in lines:
-            if any(kw in line.lower() for kw in ['items:', 'description:', 'productos:']):
-                description = line.split(':', 1)[-1].strip()
-                if description == "not visible":
-                    description = None
-                break
-
-        # Calcular confianza
-        confidence = calculate_confidence(amount, date, merchant, raw_text)
-
-        return ParseInvoiceResponse(
-            amount=amount,
-            date=date,
-            merchant=merchant,
-            description=description,
-            raw_text=raw_text,
-            confidence=confidence,
-            currency=currency
+        query_result = await asyncio.to_thread(_invoke_moondream_parsing)
+        raw_text = (
+            query_result.get("answer", "")
+            if isinstance(query_result, dict)
+            else str(query_result)
         )
 
+        log_snippet = re.sub(r"\s+", " ", raw_text.strip())[:_LOG_RAW_CHARS]
+        _logger.info("Moondream answer (primeros caracteres=%s): %s", len(raw_text), log_snippet)
+
+        (
+            structured_amount,
+            structured_currency_hint,
+            structured_merchant,
+            structured_date,
+            structured_items,
+        ) = extract_structured_fields(raw_text)
+
+        heuristic_amount, heuristic_currency = extract_amount_from_text(raw_text)
+
+        amount_pick: Optional[float] = (
+            structured_amount
+            if structured_amount is not None and structured_amount > 0
+            else heuristic_amount
+        )
+
+        raw_lc_compact = raw_text.lower()
+
+        structured_cur_pick = (
+            structured_currency_hint.strip()
+            if (
+                structured_amount is not None
+                and structured_amount > 0
+                and structured_currency_hint.strip()
+            )
+            else None
+        )
+        heuristic_cur_pick = (
+            heuristic_currency.strip()
+            if (
+                heuristic_amount is not None
+                and heuristic_currency.strip()
+                and heuristic_amount > 0
+            )
+            else None
+        )
+
+        currency_pick = resolve_invoice_currency(
+            raw_lc_compact,
+            structured_cur_pick,
+            heuristic_cur_pick,
+        )
+
+        merchant_pick = structured_merchant or extract_merchant_from_text(raw_text)
+        date_pick = structured_date or extract_date_from_text(raw_text)
+
+        description_pick: Optional[str] = structured_items
+        if description_pick is None:
+            keyed_labels = frozenset({"items", "description", "productos", "articulos"})
+            for line in raw_text.split("\n"):
+                trimmed = line.strip()
+                if ":" not in trimmed:
+                    continue
+                heading, sep, tail = trimmed.partition(":")
+                if not sep:
+                    continue
+                label_lc = heading.strip().lower()
+                if label_lc not in keyed_labels:
+                    continue
+
+                cleaned_tail = tail.strip()
+                lc_tail = cleaned_tail.lower()
+                if lc_tail in {"not visible", "nv", "---", ""}:
+                    continue
+
+                description_pick = cleaned_tail[:520]
+                break
+
+        confidence = calculate_confidence(
+            amount_pick,
+            date_pick,
+            merchant_pick,
+            raw_text,
+            description_pick,
+        )
+
+        return ParseInvoiceResponse(
+            amount=amount_pick,
+            date=date_pick,
+            merchant=merchant_pick,
+            description=description_pick,
+            raw_text=raw_text,
+            confidence=confidence,
+            currency=currency_pick,
+        )
     except HTTPException:
         raise
     except Exception as e:
