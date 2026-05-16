@@ -1,8 +1,10 @@
 # syntax=docker/dockerfile:1
-# Imagen OCR (Moondream ONNX). USE_GPU=1 sustituye onnxruntime por onnxruntime-gpu (NVIDIA en el host).
+# Imagen OCR (Moondream ONNX).
+# USE_GPU=1 solo si el DESPLIEGUE monta NVIDIA Container Toolkit + imagen CUDA (libcublas, etc.);
+# por defecto CPU (silenciosa: sin intentos de cargar libonnxruntime_providers_cuda.so).
 FROM python:3.12-slim-bookworm
 
-ARG USE_GPU=1
+ARG USE_GPU=0
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends libgomp1 \
@@ -14,10 +16,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
   && pip install --no-cache-dir -r requirements.txt
 
-# moondream arrastra onnxruntime CPU; para CUDA en contenedor hace falta el paquete -gpu.
 RUN if [ "$USE_GPU" = "1" ]; then \
       pip uninstall -y onnxruntime \
       && pip install --no-cache-dir "onnxruntime-gpu>=1.19.2,<2.0.0"; \
+    else \
+      : "onnxruntime (CPU) viene con moondream; no instalamos onnxruntime-gpu"; \
     fi
 
 COPY src/ ./src/

@@ -4,8 +4,7 @@
 # Requisitos GPU (NVIDIA): Docker + nvidia-container-toolkit en el host.
 # Ver: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
 #
-# Solo CPU (p. ej. portátil sin NVIDIA): comenta el bloque `deploy` y reconstruye con USE_GPU=0:
-#   docker compose build --build-arg USE_GPU=0
+# Solo GPU (NVIDIA): descomenta `gpus:` y usa build con USE_GPU=1 (imagen CUDA o runtime NVIDIA en host).
 #
 services:
   ocr:
@@ -13,7 +12,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        USE_GPU: "1"
+        USE_GPU: "0"
     image: gastos-ocr:local
     container_name: gastos-ocr
     ports:
@@ -31,9 +30,8 @@ services:
     # Variables extra: copia .env.example → .env en esta carpeta o define aquí bajo `environment`.
     volumes:
       - huggingface_ocr_cache:/var/cache/huggingface
-    # Requiere Docker con soporte GPU (nvidia-container-toolkit). Sin GPU: comenta la línea siguiente
-    # y haz build con: docker compose build --build-arg USE_GPU=0
-    gpus: all
+    # GPUs: sólo si hiciste build con USE_GPU=1 *y* tienes nvidia-container-toolkit.
+    # gpus: all
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=5)"]
