@@ -1,18 +1,11 @@
-# Servicio OCR (FastAPI + Moondream). Ubicación real del código: carpeta ocr/ del repo.
-# El módulo Nest vive en backend/src/ocr/ y solo hace HTTP a este servicio.
-#
-# Requisitos GPU (NVIDIA): Docker + nvidia-container-toolkit en el host.
-# Ver: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
-#
-# Solo GPU (NVIDIA): descomenta `gpus:` y usa build con USE_GPU=1 (imagen CUDA o runtime NVIDIA en host).
-#
+
 services:
   ocr:
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        USE_GPU: "0"
+        USE_GPU: "${USE_GPU:-1}"
     image: gastos-ocr:local
     container_name: gastos-ocr
     ports:
@@ -22,17 +15,29 @@ services:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       MOONDREAM_ONNX_VARIANT: "${MOONDREAM_ONNX_VARIANT:-2b}"
+      OCR_VLM_PROMPT_MODE: "${OCR_VLM_PROMPT_MODE:-transcribe}"
     volumes:
       - huggingface_ocr_cache:/var/cache/huggingface
-    GPUs: "1"
-    gpus: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=5)"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=5)",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 120s
+      start_period: 180s
 
 volumes:
   huggingface_ocr_cache:
